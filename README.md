@@ -114,8 +114,8 @@ sre-command-center/
 ## LangSmith tracing
 
 Every agent run is traced end-to-end: LLM calls, tool inputs/outputs, token usage, and latency per step.
+<img width="1438" height="655" alt="Screenshot 2026-05-25 at 4 20 22 PM" src="https://github.com/user-attachments/assets/a1f4fc22-4b65-4b01-afdf-61787532db36" />
 
-*Screenshot coming soon.*
 
 ---
 
