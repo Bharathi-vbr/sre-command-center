@@ -132,3 +132,134 @@ To deploy your own copy:
 2. Create a new HuggingFace Space (Gradio SDK)
 3. Push the code to the Space remote
 4. Add `GROQ_API_KEY` as a Space secret (Settings → Variables and secrets)
+
+---
+
+## Adapting for production
+
+This project uses mock data for the five tools. Replacing each mock with a real integration is the only change needed to make the agent production-ready.
+
+### 1. Wire tools to real data sources
+
+Every tool lives in [`agent/tools.py`](agent/tools.py). Replace the mock return values:
+
+| Tool | Current | Replace with |
+|---|---|---|
+| `fetch_recent_alerts` | hardcoded alert dicts | PagerDuty API, OpsGenie, or Alertmanager webhook |
+| `check_deployment` | hardcoded deploy list | ArgoCD API, Spinnaker, or your CI/CD release endpoint |
+| `fetch_metrics` | random numbers | Prometheus `query` API, Datadog metrics API, or CloudWatch |
+| `search_runbook` | ChromaDB (already real) | Keep as-is — just add your own runbooks to `data/runbooks/` |
+| `search_incidents` | ChromaDB (already real) | Keep as-is — or ingest from PagerDuty incident history |
+
+Example — replacing `fetch_metrics` with a real Prometheus query:
+
+```python
+import requests
+
+@tool
+def fetch_metrics(service_name: str) -> str:
+    """Fetch live CPU, error rate, and p99 latency from Prometheus."""
+    base = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+    queries = {
+        "cpu": f'rate(container_cpu_usage_seconds_total{{service="{service_name}"}}[5m])',
+        "error_rate": f'rate(http_requests_total{{service="{service_name}",status=~"5.."}}[5m])',
+        "p99_latency": f'histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{{service="{service_name}"}}[5m]))',
+    }
+    results = {}
+    for metric, query in queries.items():
+        r = requests.get(f"{base}/api/v1/query", params={"query": query}, timeout=5)
+        results[metric] = r.json()["data"]["result"]
+    return str(results)
+```
+
+### 2. Add your own runbooks and past incidents
+
+Drop markdown files into `data/runbooks/` and `data/incidents/`. Delete `chroma_db/` and restart — `ingest_all()` rebuilds the vector store automatically.
+
+```bash
+# Add a new runbook
+echo "# Database replication lag\n\nStep 1: ..." > data/runbooks/db_replication_lag.md
+
+# Rebuild the vector store
+rm -rf chroma_db/
+python -c "from rag.ingest import ingest_all; ingest_all()"
+```
+
+The agent will immediately find and cite it during investigations.
+
+### 3. Swap the LLM
+
+The LLM is set in [`agent/core.py`](agent/core.py). One line change:
+
+```python
+# Groq (current — fast, free tier)
+from langchain_groq import ChatGroq
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1)
+
+# OpenAI
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+
+# Anthropic Claude
+from langchain_anthropic import ChatAnthropic
+llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0.1)
+
+# Azure OpenAI (for enterprises with data residency requirements)
+from langchain_openai import AzureChatOpenAI
+llm = AzureChatOpenAI(azure_deployment="gpt-4o", temperature=0.1)
+```
+
+### 4. Scale the vector store
+
+ChromaDB runs locally by default. For a shared team deployment, switch to a hosted vector DB:
+
+```python
+# rag/store.py — swap the client
+import chromadb
+
+# Local (default)
+client = chromadb.PersistentClient(path="chroma_db")
+
+# ChromaDB Cloud
+client = chromadb.HttpClient(host="your-chroma-host", port=8000)
+
+# Or swap ChromaDB entirely for Pinecone, Weaviate, or pgvector
+```
+
+### 5. Deploy internally
+
+**Docker (single container):**
+```bash
+docker build -t sre-command-center .
+docker run -p 7860:7860 \
+  -e GROQ_API_KEY=$GROQ_API_KEY \
+  -e LANGCHAIN_API_KEY=$LANGCHAIN_API_KEY \
+  sre-command-center
+```
+
+**Kubernetes (team-shared):**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-command-center
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: app
+        image: your-registry/sre-command-center:latest
+        ports:
+        - containerPort: 7860
+        envFrom:
+        - secretRef:
+            name: sre-command-center-secrets
+```
+
+### 6. Security considerations for production
+
+- **Never log raw tool output** — it may contain secrets, PII, or internal hostnames. LangSmith traces are off by default unless `LANGCHAIN_TRACING_V2=true`.
+- **Scope API credentials** — the tool credentials (Prometheus, PagerDuty, etc.) should be read-only service accounts.
+- **Network isolation** — run the container inside your VPC; only expose port 7860 behind your internal SSO proxy.
+- **Rate-limit the LLM** — set `max_iterations=8` (already done) and wrap the agent in a per-user semaphore to prevent runaway cost from concurrent requests.
